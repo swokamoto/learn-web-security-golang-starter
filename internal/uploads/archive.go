@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"os"
 	"path/filepath"
 	"strings"
@@ -67,9 +66,18 @@ func ExtractTaxDocumentArchive(encryptionKeyring Keyring, contents []byte, extra
 	importDirectory := filepath.Join(extractionDirectory, identifier.String())
 	plannedEntries := make([]plannedArchiveEntry, 0, len(archiveReader.File))
 	for _, entry := range archiveReader.File {
-		entryDestination := filepath.Join(importDirectory, entry.Name)
 		if isIgnoredArchiveEntry(entry.Name) {
 			continue
+		}
+		if filepath.IsAbs(entry.Name) || strings.HasPrefix(entry.Name, "/") || strings.Contains(entry.Name, "\\") {
+			return ExtractedTaxDocumentArchive{}, &ArchiveImportError{Message: "Archive contains an unsafe entry path.", StatusCode: 400}
+		}
+		if entry.Mode()&os.ModeSymlink != 0 {
+			return ExtractedTaxDocumentArchive{}, &ArchiveImportError{Message: "Archive contains a symbolic link.", StatusCode: 400}
+		}
+		entryDestination := filepath.Join(importDirectory, entry.Name)
+		if !isInsideDirectory(importDirectory, entryDestination) {
+			return ExtractedTaxDocumentArchive{}, &ArchiveImportError{Message: "Archive contains an unsafe entry path.", StatusCode: 400}
 		}
 		if strings.HasSuffix(entry.Name, "/") {
 			plannedEntries = append(plannedEntries, plannedArchiveEntry{directory: true, destination: entryDestination})
@@ -79,9 +87,9 @@ func ExtractTaxDocumentArchive(encryptionKeyring Keyring, contents []byte, extra
 		if err != nil {
 			return ExtractedTaxDocumentArchive{}, &ArchiveImportError{Message: "Choose a valid ZIP archive.", StatusCode: 400}
 		}
-		contentType := mime.TypeByExtension(filepath.Ext(entry.Name))
-		if contentType == "" {
-			contentType = "application/octet-stream"
+		contentType, _, supported := detectDocumentType(entryContents)
+		if !supported {
+			return ExtractedTaxDocumentArchive{}, &ArchiveImportError{Message: "Archive contains an unsupported document type.", StatusCode: 400}
 		}
 		storedContents, encrypted, err := encryptDocument(entryContents, encryptionKeyring)
 		if err != nil {
@@ -139,6 +147,14 @@ func ExtractTaxDocumentArchive(encryptionKeyring Keyring, contents []byte, extra
 		}
 	}
 	return archive, nil
+}
+
+func isInsideDirectory(directory, candidate string) bool {
+	relativePath, err := filepath.Rel(directory, candidate)
+	if err != nil || relativePath == "." || relativePath == ".." || filepath.IsAbs(relativePath) {
+		return false
+	}
+	return !strings.HasPrefix(relativePath, ".."+string(filepath.Separator))
 }
 
 func isIgnoredArchiveEntry(entryName string) bool {

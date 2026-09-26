@@ -9,6 +9,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -26,24 +27,92 @@ func applyMiddleware(handler http.Handler, middlewareChain ...middleware) http.H
 	for _, currentMiddleware := range slices.Backward(middlewareChain) {
 		handler = currentMiddleware(handler)
 	}
+
 	return handler
 }
 
-func permissiveCORS(next http.Handler) http.Handler {
+func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
-		if origin := request.Header.Get("Origin"); origin != "" {
-			responseWriter.Header().Set("Access-Control-Allow-Origin", origin)
-			responseWriter.Header().Set("Access-Control-Allow-Credentials", "true")
-			responseWriter.Header().Set("Vary", "Origin")
+		scriptSource := "'self'"
+		if nonce := httpx.CSPNonce(request.Context()); nonce != "" {
+			scriptSource += " 'nonce-" + nonce + "'"
 		}
-		if request.Method == http.MethodOptions {
-			responseWriter.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-			responseWriter.Header().Set("Access-Control-Allow-Headers", request.Header.Get("Access-Control-Request-Headers"))
-			responseWriter.WriteHeader(http.StatusNoContent)
-			return
-		}
+		header := responseWriter.Header()
+		header.Set("Content-Security-Policy", "default-src 'self'; script-src "+scriptSource+"; style-src 'self'; img-src 'self' data:; frame-src 'self'; frame-ancestors 'self'; object-src 'none'; base-uri 'self'; form-action 'self'")
+		header.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		header.Set("X-Content-Type-Options", "nosniff")
+		header.Set("X-Frame-Options", "SAMEORIGIN")
+		header.Set("Cross-Origin-Opener-Policy", "same-origin")
+		header.Set("Cross-Origin-Resource-Policy", "same-origin")
+		header.Set("Origin-Agent-Cluster", "?1")
+		header.Set("X-DNS-Prefetch-Control", "off")
+		header.Set("X-Download-Options", "noopen")
+		header.Set("X-Permitted-Cross-Domain-Policies", "none")
+		header.Set("X-XSS-Protection", "0")
 		next.ServeHTTP(responseWriter, request)
 	})
+}
+
+func crossOriginResource(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		responseWriter.Header().Set("Cross-Origin-Resource-Policy", "cross-origin")
+		next.ServeHTTP(responseWriter, request)
+	})
+}
+
+func publicCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		responseWriter.Header().Set("Access-Control-Allow-Origin", "*")
+		next.ServeHTTP(responseWriter, request)
+	})
+}
+
+func publicCORSPreflight(responseWriter http.ResponseWriter, _ *http.Request) {
+	responseWriter.Header().Set("Access-Control-Allow-Origin", "*")
+	responseWriter.Header().Set("Access-Control-Allow-Methods", "GET")
+	responseWriter.WriteHeader(http.StatusNoContent)
+}
+
+func verifyRequestOrigin(appOrigin string, renderer *templates.Renderer) middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+			if request.Method != http.MethodPost || isPublicAuthenticationPath(request.URL.Path) {
+				next.ServeHTTP(responseWriter, request)
+				return
+			}
+			if !trustedRequestSource(request, appOrigin) {
+				if err := httpx.RespondWithErrorPage(responseWriter, renderer, http.StatusForbidden, "Forbidden", "Your request could not be verified."); err != nil {
+					http.Error(responseWriter, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				}
+				return
+			}
+			next.ServeHTTP(responseWriter, request)
+		})
+	}
+}
+
+func isPublicAuthenticationPath(path string) bool {
+	switch path {
+	case "/login", "/login/totp", "/login/totp/cancel", "/signup", "/recover-mfa", "/password-reset":
+		return true
+	default:
+		return false
+	}
+}
+
+func trustedRequestSource(request *http.Request, appOrigin string) bool {
+	if origin := request.Header.Get("Origin"); origin != "" {
+		return origin == appOrigin
+	}
+	referer := request.Header.Get("Referer")
+	if referer == "" {
+		return false
+	}
+	refererURL, err := url.Parse(referer)
+	if err != nil || refererURL.Scheme == "" || refererURL.Host == "" {
+		return false
+	}
+	return refererURL.Scheme+"://"+refererURL.Host == appOrigin
 }
 
 func cspNonce(next http.Handler) http.Handler {
